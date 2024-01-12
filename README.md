@@ -20,7 +20,7 @@ If you wish to submit via an emailed zip file:
 ### Some guidance
 
 1. Use open source tools and ecosystems - Python or R. Do not use proprietary tools, such as SAS, SPSS, JMP, Tableau, or Stata. 
-2. Use the Internet as a resource to help you complete your work. We do it all the time.
+2. Use the Internet - including generative AI tools like ChatGPT - as a resource to help you complete your work. We do it all the time.
 3. Comment your code such that a fellow data scientist who isn't familiar with this data or analysis could understand the steps you take.
 4. There are many ways to approach and solve the problems presented in this exercise.
 5. [DB Browser for SQLite](https://sqlitebrowser.org/dl/) is a cross-platform application you can use for initially exploring the SQLite database.
