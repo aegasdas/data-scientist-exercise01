@@ -1,6 +1,6 @@
 ## File descriptions for the Analytics Exercise
 In code folder:
-1. exercise_1_query.sql: The SQL query to combine the tables and create the flat file.
+1. exercise1_query.sql: The SQL query to combine the tables and create the flat file.
 2. RTI_exercise_code.Rmd: Includes all the code for my exploratory data analysis, data processing, model selection, model assessment, and any figures.
 
 In data folder:
