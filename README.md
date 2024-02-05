@@ -1,3 +1,13 @@
+## File descriptions for the Analytics Exercise
+In code folder:
+1. exercise_1_query.sql: The SQL query to combine the tables and create the flat file.
+2. RTI_exercise_code.Rmd: Includes all the code for my exploratory data analysis, data processing, model selection, model assessment, and any figures.
+
+In data folder:
+1. rti_exercise1.csv: The flat data file created from the SQL query in CSV format.
+
+exercise1_writeup.docx: The document that contains my final write-up for this assignment. 
+
 ## RTI CDS Analytics Exercise 01
 
 Welcome to Exercise 01. This exercise provides a small SQLite database with some data derived from the 1996 US Census and a few analytic questions related to working with SQL and open source analysis packages.

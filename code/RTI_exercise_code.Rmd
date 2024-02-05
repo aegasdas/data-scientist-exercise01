@@ -1,0 +1,680 @@
+---
+title: "RTI International Analytic Exercise"
+author: "Angela Gasdaska"
+date: "2024-02-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Importing relevant packages.
+```{r, include=FALSE}
+library(tidyverse)
+library(Hmisc)
+library(vtable)
+library(gmodels)
+library(mgcv)
+library(partykit)
+library(car)
+library(confintr)
+library(randomForest)
+library(ROCit)
+library(caret)
+library(ggplot2)
+```
+
+# Data Preparation and Exploration
+
+## Importing the data and taking an initial look at it.
+```{r}
+# Importing the data.
+census <- read.csv("C:/Users/Angela Gasdaska/Documents/GitHub/data-scientist-exercise01/rti_exercise1.csv")
+
+# Looking at its structure.
+str(census)
+
+# Examining missing values.
+colSums(is.na(census))
+
+# Dropping the id variable
+census = subset(census, select=-c(id))
+
+# Examining frequencies of all variables.
+mapply(table, census)
+
+# Replacing "?" with "Missing"
+census[census == '?'] = 'Missing'
+```
+ 
+## Exploring continuous variables.
+```{r}
+# Creating a dataset consisting of only the numerical variables to explore
+census_cont = census %>% select(where(is.numeric))
+
+# Removing over_50k as it's binary and I don't want to explore relationships with target before splitting into train/test.
+census_cont = subset(census_cont, select=-c(over_50k))
+
+# Examining histograms for all continuous variables.
+hist.data.frame(census_cont)
+
+# Examining summary statistics.
+st(census_cont)
+
+# Examining the correlation between continuous variables.
+cor(census_cont)
+```
+Mostly zeros in capital gain and capital loss and right skewed. Age is right skewed. Hours worked per week is centered around 40 and symmetric. None of the continuous variables are highly correlated with one another.
+
+## Looking at education number vs. education level.
+```{r}
+table(census$education_num, census$education_level)
+```
+There's a 1:1 mapping between education_num and education_level (they are essentially the same variable). I am going to keep education_level instead of the number, as it's more interpretable as a categorical variable and it makes more sense for it to be a categorical variable. Going from 11th to 12th grade is one level and so is going from Bachelor's to Master's, and I don't think they equate to the same "increase" in education as the continuous variable would assume.
+
+## Dropping education_num from further analysis.
+```{r}
+census = subset(census, select=-c(education_num))
+```
+
+## Exploring categorical variables and some of the relationships between them.
+```{r}
+# List of categorical variables.
+cat_vars = c("country_name", "education_level", "marital_status", "occupation", "race", "relationship", "sex", "workclass")
+# Dataset with only categorical variables.
+census_cat = census[cat_vars]
+
+# Proportions in each category for categorical
+for (i in 1:length(cat_vars)){
+  print(prop.table(table(census_cat[[i]])))
+}
+
+# Very small number of observations in a lot of the country categories and the vast majority are in the US. I don't feel comfortable making assumptions about how to collapse these, and I don't think such small categories would generalize well, so I am going to drop country from further analysis.
+
+census = subset(census, select=-c(country_name))
+census_cat = subset(census_cat, select=-c(country_name))
+
+cat_vars = c("education_level", "marital_status", "occupation", "race", "relationship", "sex", "workclass")
+
+# Examining the relationship between some of the different categorical variables that seem like they could be related.
+
+# Occupation v. workclass
+table(census_cat$occupation, census_cat$workclass)
+cramersv(census_cat[c("occupation", "workclass")])
+
+# relationship v. marital status
+table(census_cat$relationship, census_cat$marital_status)
+cramersv(census_cat[c("relationship", "marital_status")])
+
+# relationship v. sex
+table(census_cat$relationship, census_cat$sex)
+cramersv(census_cat[c("relationship", "sex")])
+
+# marital_status v. sex
+table(census_cat$marital_status, census_cat$sex)
+cramersv(census_cat[c("marital_status", "sex")])
+```
+There are definitely some clear relationships between workclass and occupation and also marital_status, sex, and relationship. I will keep all these variables for now and try different combinations in the modeling stage.
+
+## Splitting the data into train, validation, and test.
+```{r}
+# Setting the fractions (70/20/10).
+fraction_train = 0.7
+fraction_val = 0.2
+fraction_test = 0.1
+
+# Compute required sample sizes for each split.
+sampleSizeTraining = floor(fraction_train*nrow(census))
+sampleSizeValidation = floor(fraction_val*nrow(census))
+sampleSizeTest = floor(fraction_test*nrow(census))
+
+# Create the randomly-sampled indices to split dataset. Use setdiff() to avoid overlapping subsets of indices.
+set.seed(12345)
+indicesTraining = sort(sample(seq_len(nrow(census)), size=sampleSizeTraining))
+indicesNotTraining = setdiff(seq_len(nrow(census)), indicesTraining)
+set.seed(12345)
+indicesValidation = sort(sample(indicesNotTraining, size=sampleSizeValidation))
+indicesTest = setdiff(indicesNotTraining, indicesValidation)
+
+# Finally, output the three datasets for training, validation and test.
+train = census[indicesTraining, ]
+val = census[indicesValidation, ]
+test = census[indicesTest, ]
+```
+
+## Examining bivariate relationships between target (over_50k) and each potential categorical predictor.
+```{r}
+# Making a list of all the categorical variables.
+cat_vars = c("education_level", "marital_status", "occupation", "race", "relationship", "sex", "workclass")
+train_cat = train[cat_vars]
+
+# Crosstables and chi-square tests between all categorical variables and over_50k
+for(i in 1:length(cat_vars)){
+  print(table(train$over_50k, train_cat[[i]]))
+  print(prop.table(table(train$over_50k, train_cat[[i]]), margin = 2))
+  print(chisq.test(train$over_50k, train_cat[[i]]))
+}
+
+# Fixing quasi-complete separation issues.
+
+## Combining Preschool with 1st-4th (the next closest education level and proportionally similar with outcome)
+train$education_level_fix <- ifelse(train$education_level=="Preschool", '1st-4th',train$education_level)
+table(train$education_level_fix)
+
+## Combining Never-Worked with without-pay (the next closest job category and most proportionally similar with outcome)
+train$workclass_fix <- ifelse(train$workclass=="Never-worked", 'Without-pay',train$workclass)
+table(train$workclass_fix)
+
+```
+With these initial bivariate investigations, all categorical variables appear to have a relationship with the target.
+
+## Exploring target vs. continuous variables.
+```{r}
+# Making a list of all the continuous variables.
+cont_vars = c("age", "capital_gain", "capital_loss", "hours_week")
+train_cont = train[c(cont_vars, "over_50k")]
+
+# Looking at box plots.
+
+# Age v. over_50k
+boxplot(age~over_50k,data=train, main="Age v. income over 50k",
+   xlab="Income over 50k", ylab="Age")
+
+# Capital_gain v. over_50k
+boxplot(capital_gain~over_50k,data=train, main="Capital gain v. income over 50k",
+   xlab="Income over 50k", ylab="Capital Gain")
+
+# Capital_loss v. over_50k
+boxplot(capital_loss~over_50k,data=train, main="Capital loss v. income over 50k",
+   xlab="Income over 50k", ylab="Capital Loss")
+
+# Hours worked v. over 50k
+boxplot(hours_week~over_50k,data=train, main="Hours worked per week v. income over 50k",
+   xlab="Income over 50k", ylab="Hours worked")
+
+# Individual logistic regressions with each continuous predictor and the target.
+for(i in 1:length(cont_vars)){
+  print(summary(glm(train$over_50k ~ train_cont[[i]], family=binomial(link="logit"))))
+}
+```
+# Preparing for initial logistic regression model
+
+## Checking if continuous variables meet assumptions for logistic regression or if they should be binned.
+```{r}
+lapply(cont_vars, function(x) {
+  
+  # logit with continuous variables as they are
+  logit_linear <- glm(substitute(over_50k ~ i,list(i = as.name(x))), data = train_cont, family = binomial(link="logit"))
+  
+  # logit with splines of continuous variables
+  logit_gam <-mgcv::gam(substitute(over_50k ~ s(i),list(i = as.name(x))), data = train_cont, family = binomial(link="logit"), method = 'REML')
+  
+  # Testing to see if there's a difference between these two models.
+  anova(logit_linear, logit_gam, test = 'Chisq')
+})
+```
+Results of the test indicate that the continuous variables do NOT meet the linearity assumption and need to be binned.
+
+## Using conditional inference trees to determine bins for continuous variables.
+```{r}
+# Tree for age.
+age_tree <- ctree(over_50k ~ age, data=train_cont)
+age_tree
+
+# Tree for capital gain.
+cg_tree <- ctree(over_50k ~ capital_gain, data=train_cont)
+cg_tree
+
+# Tree for capital loss.
+cl_tree <- ctree(over_50k ~ capital_loss, data=train_cont)
+cl_tree
+
+# Tree for hours worked per week.
+hw_tree <- ctree(over_50k ~ hours_week, data=train_cont)
+hw_tree
+```
+Pruning age tree to a depth of 3 and using the following cut points: 23, 26, 28, 29, 31, 35, 61
+Pruning capital_gain tree to a depth of 1 and using the following cutpoint: 5060
+Pruning capital_loss tree to a depth of 1 and using the following cutpoint: 1816 
+Pruning hours_week tree to a depth of 3 and using the following cutpoints: 
+
+## Creating binned versions of all the continuous variables based on the above cutpoints determined by the trees.
+```{r}
+# Binning age.
+train = train %>% mutate(age_bin = cut(age, breaks=c(0, 23, 26, 28, 29, 31, 35, 61, 90)))
+
+# Binning capital_gain.
+train$capital_gain_bin = ifelse(train$capital_gain > 5060, '[0,5060]', '(5060, 99999]')
+
+# Binning capital_loss.
+train$capital_loss_bin = ifelse(train$capital_loss > 1816, '[0,1816]', '(1816, 4356]')
+
+# Binning hours_week.
+train = train %>% mutate(hours_week_bin = cut(hours_week, breaks=c(0, 34, 39, 43, 99)))
+```
+
+# Logistic regression modeling
+## Running an initial logistic regression model with all variables.
+```{r}
+# Subsetting data to only include relevant variables.
+train_logistic <- subset(train, select=-c(education_level, workclass, age, capital_gain, capital_loss, hours_week))
+
+# Running an initial logistic regression with all variables
+full_model <- glm(over_50k ~ .,data = train_logistic, family = binomial(link = "logit"))
+summary(full_model)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(full_model)
+
+# Looking at VIF for any multicollinearity concerns
+vif(full_model)
+
+# Want to address any potential issues with variables I identified as being related earlier (workclass, occupation, marital_status, sex, relationship). Adjusted GVIF for workclass is on the higher side.
+
+# Occupation v. workclass table
+table(train_logistic$occupation, train_logistic$workclass_fix)
+cramersv(train_logistic[c("occupation", "workclass_fix")])
+
+# relationship v. marital status
+table(train_logistic$relationship, train_logistic$marital_status)
+cramersv(train_logistic[c("relationship", "marital_status")])
+
+# relationship v. sex
+table(train_logistic$relationship, train_logistic$sex)
+cramersv(train_logistic[c("relationship", "sex")])
+
+# marital_status v. sex
+table(train_logistic$marital_status, train_logistic$sex)
+cramersv(train_logistic[c("marital_status", "sex")])
+
+```
+## First dealing with the issue with workclass and occupation.
+```{r}
+# First dropping workclass keeping occupation.
+train_o <- subset(train_logistic, select=-c(workclass_fix))
+
+# Running the model again now that workclass has been dropped.
+full_model2 <- glm(over_50k ~ .,data = train_o, family = binomial(link = "logit"))
+summary(full_model2)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(full_model2)
+
+# Looking at vif
+vif(full_model2)
+
+# Next dropping occupation and keeping workclass.
+train_w <- subset(train_logistic, select=-c(occupation))
+
+# Running the model again now that workclass has been dropped.
+full_model3 <- glm(over_50k ~ .,data = train_w, family = binomial(link = "logit"))
+summary(full_model3)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(full_model3)
+
+# Looking at vif.
+vif(full_model3)
+```
+Model with occupation has a better AIC, so going with occupation over workclass.
+
+## Next dealing with the relationships between marital_status, relationship, and sex.
+```{r}
+# Trying one model with relationship, dropping marital status and sex.
+train_r <- subset(train_o, select=-c(marital_status, sex))
+
+model_4 <- glm(over_50k ~ .,data = train_r, family = binomial(link = "logit"))
+summary(model_4)
+
+# Looking at the individual significance of each of the variables in the model.
+save4 = car::Anova(model_4)
+vif(model_4)
+
+# Trying one model dropping relationship and including marital_status and sex.
+train_ms <- subset(train_o, select=-c(relationship))
+
+model_5 <- glm(over_50k ~ .,data = train_ms, family = binomial(link = "logit"))
+summary(model_5)
+vif(model_5)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(model_5)
+
+# Adding an interaction between sex and marital status.
+model_6 <- glm(over_50k ~ . + sex:marital_status,data = train_ms, family = binomial(link = "logit"))
+summary(model_6)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(model_6)
+
+# Trying only marital status and not including sex or relationship.
+train_m <- subset(train_o, select=-c(relationship, sex))
+
+model_7 <- glm(over_50k ~ .,data = train_m, family = binomial(link = "logit"))
+summary(model_7)
+
+# Looking at the individual significance of each of the variables in the model.
+car::Anova(model_7)
+```
+Moving forward with model 4 and model 6. They have the lowest AICs. Because the interaction between marital_status and sex is significant, I can't ignore it, and therefore I shouldn't use the model that includes marital_status and sex without the interaction.
+
+## Assessing the two final logistic regression models using AUC.
+```{r}
+# Making predictions on training for model 4.
+pred_over50k_m4 = predict(model_4, train, type = 'response')
+
+# ROC Curve
+m4_roc <- rocit(pred_over50k_m4, train$over_50k)
+plot(m4_roc)
+
+# Obtaining cutoff and creating a binary variable.
+cutoff_m4 <- ksplot(m4_roc)$`KS Cutoff`
+cutoff_m4
+pred_over50_bin_m4 <- ifelse(pred_over50k_m4 > cutoff_m4, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference = as.factor(train$over_50k), data = as.factor(pred_over50_bin_m4))
+
+# Looking at the AUC for model 4
+m4_roc$AUC
+
+# Making predictions on training for model 6
+pred_over50k_m6 = predict(model_6, train, type = 'response')
+
+# ROC Curve
+m6_roc <- rocit(pred_over50k_m6, train$over_50k)
+plot(m6_roc)
+
+# Obtaining cutoff and creating a binary variable.
+cutoff_m6 <- ksplot(m6_roc)$`KS Cutoff`
+cutoff_m6
+pred_over50_bin_m6 <- ifelse(pred_over50k_m6 > cutoff_m6, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference = as.factor(train$over_50k), data = as.factor(pred_over50_bin_m6))
+
+# Looking at the AUC for model 6
+m6_roc$AUC
+```
+These models are very similar in terms of performance metrics. I will assess them both on the validation data.
+
+
+# GAM model with similar variables as final logistic (just using continuous versions with splines instead of binned versions of continuous variables).
+```{r}
+# First GAM model, mirrored after logistic model 4.
+gam1 <- mgcv::gam(over_50k ~ relationship +
+                             occupation +
+                             race +
+                             education_level_fix +
+                             s(age) + 
+                             s(capital_gain) +
+                             s(capital_loss) + 
+                             s(hours_week), data=train, family=binomial())
+
+summary(gam1)
+
+# Second GAM model, mirrored after logistic model 6.
+gam2 <- mgcv::gam(over_50k ~ sex:marital_status +
+                             occupation +
+                             race +
+                             education_level_fix +
+                             s(age) + 
+                             s(capital_gain) +
+                             s(capital_loss) + 
+                             s(hours_week), data=train, family=binomial())
+
+summary(gam2)
+```
+
+## Assessing the two GAM models.
+```{r}
+# Making predictions on training for model 4
+pred_over50k_gam1 = predict(gam1, train, type = 'response')
+
+# ROC Curve
+gam1_roc <- rocit(pred_over50k_gam1, train$over_50k)
+plot(gam1_roc)
+
+# Obtaining cutoff and creating a binary variable.
+cutoff_gam1 <- ksplot(gam1_roc)$`KS Cutoff`
+cutoff_gam1
+pred_over50_bin_gam1 <- ifelse(pred_over50k_gam1 > cutoff_gam1, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(train$over_50k), data=as.factor(pred_over50_bin_gam1))
+
+# Looking at the AUC for model 4
+gam1_roc$AUC
+
+# Making predictions on training for model 6
+pred_over50k_gam2 = predict(gam2, train, type = 'response')
+
+# ROC Curve
+gam2_roc <- rocit(pred_over50k_gam2, train$over_50k)
+plot(gam2_roc)
+
+# Obtaining cutoff and creating a binary variable.
+cutoff_gam2 <- ksplot(gam2_roc)$`KS Cutoff`
+cutoff_gam2
+pred_over50_bin_gam2 <- ifelse(pred_over50k_gam2 > cutoff_gam2, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(train$over_50k), data=as.factor(pred_over50_bin_gam2))
+
+# Looking at the AUC for model 4
+gam2_roc$AUC
+```
+GAMs perform similarly to the logistic regression. GAM 2 has the best AUC out of all models on training, but all of them are really close.
+
+# Random Forest
+```{r}
+# Running an initial random forest. Using continuous predictors instead of binned. Dropping workclass as it's very related to occupation, and dropping relationship due to it's relationship with marital_status and sex. Using original versions of variables, because quasi-complete separation isn't a concern with RFs.
+
+train_rf <- subset(train, select=-c(education_level_fix, workclass, workclass_fix, age_bin, capital_gain_bin, capital_loss_bin, hours_week_bin, relationship))
+
+set.seed(123)
+rf1 <- randomForest(factor(over_50k) ~.,data=train_rf, ntree=500, importance = TRUE)
+plot(rf1)
+
+# Tuning mtry
+x = subset(train_rf, select = -c(over_50k))
+y = factor(train_rf$over_50k)
+set.seed(123)
+tuneRF(x = x, y = y, plot = TRUE, ntreeTry=500, stepFactor = 1.5)
+tuneRF(x = x, y = y, plot = TRUE, ntreeTry=500, stepFactor = 0.5)
+```
+mtry of 2 seems to be best. 
+
+## Tuned/final random forest
+```{r}
+set.seed(123)
+rf2 <- randomForest(factor(over_50k) ~.,data=train_rf, ntree=500, mtry = 2, importance = TRUE)
+
+#variable importance
+varImpPlot(rf2, sort = TRUE)
+
+# Predicted probabilities and ROC curve
+pred_rf = predict(rf2, train, type = 'prob')
+
+rf_roc <- rocit(pred_rf[,2], as.numeric(train$over_50k))
+plot(rf_roc)
+
+# Looking at the AUC for the RF
+rf_roc$AUC
+
+# Obtaining cutoff and creating a binary variable.
+cutoff_rf <- ksplot(rf_roc)$`KS Cutoff`
+cutoff_rf
+pred_over50_bin_rf <- ifelse(pred_rf[,2] > cutoff_rf, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(train$over_50k), data=as.factor(pred_over50_bin_rf))
+```
+
+# Assessing models on validation data.
+## Adjust validation data in the same way training data was adjusted.
+```{r}
+## Combining Preschool with 1st-4th (the next closest education level and proportionally similar with outcome)
+val$education_level_fix <- ifelse(val$education_level=="Preschool", '1st-4th',val$education_level)
+table(val$education_level_fix)
+
+## Combining Never-Worked with without-pay (the next closest job category and most proportionally similar with outcome)
+val$workclass_fix <- ifelse(val$workclass=="Never-worked", 'Without-pay',val$workclass)
+table(val$workclass_fix)
+
+# Binning age.
+val = val %>% mutate(age_bin = cut(age, breaks=c(0, 23, 26, 28, 29, 31, 35, 61, 90)))
+
+# Binning capital_gain.
+val$capital_gain_bin = ifelse(val$capital_gain > 5060, '[0,5060]', '(5060, 99999]')
+
+# Binning capital_loss.
+val$capital_loss_bin = ifelse(val$capital_loss > 1816, '[0,1816]', '(1816, 4356]')
+
+# Binning hours_week.
+val = val %>% mutate(hours_week_bin = cut(hours_week, breaks=c(0, 34, 39, 43, 99)))
+
+```
+
+## Assessing how the logistic regressions performs on the validation data.
+```{r}
+# Making predictions on validation for logistic model 4
+pred_over50k_m4_val = predict(model_4, val, type = 'response')
+
+# ROC Curve
+m4_roc_val <- rocit(pred_over50k_m4_val, val$over_50k)
+plot(m4_roc_val)
+
+# Looking at the AUC for model 4
+m4_roc_val$AUC
+
+# Creating a binary variable based on the already established cutoff
+pred_over50_bin_m4_val <- ifelse(pred_over50k_m4_val > cutoff_m4, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference = as.factor(val$over_50k), data = as.factor(pred_over50_bin_m4_val))
+
+# Making predictions on validation for model 6
+pred_over50k_m6_val = predict(model_6, val, type = 'response')
+
+# ROC Curve
+m6_roc_val <- rocit(pred_over50k_m6_val, val$over_50k)
+plot(m6_roc_val)
+
+# Looking at the AUC for model 6
+m6_roc_val$AUC
+
+# Creating a binary variable based on the already established cutoff
+pred_over50_bin_m6_val <- ifelse(pred_over50k_m6_val > cutoff_m6, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference = as.factor(val$over_50k), data = as.factor(pred_over50_bin_m6_val))
+```
+
+## Assessing how the GAMs perform on the validation data.
+```{r}
+# Making predictions on training for model 4
+pred_over50k_gam1_val = predict(gam1, val, type = 'response')
+
+# ROC Curve
+gam1_roc_val <- rocit(pred_over50k_gam1_val, val$over_50k)
+plot(gam1_roc_val)
+
+# Looking at the AUC for model 4
+gam1_roc_val$AUC
+
+# Binning based on established cutoff
+pred_over50_bin_gam1_val <- ifelse(pred_over50k_gam1_val > cutoff_gam1, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(val$over_50k), data=as.factor(pred_over50_bin_gam1_val))
+
+# Making predictions on training for model 6
+pred_over50k_gam2_val = predict(gam2, val, type = 'response')
+
+# ROC Curve
+gam2_roc_val <- rocit(pred_over50k_gam2_val, val$over_50k)
+plot(gam2_roc_val)
+
+# Looking at the AUC for model 4
+gam2_roc_val$AUC
+
+# Binning based on established cutoff
+pred_over50_bin_gam2_val <- ifelse(pred_over50k_gam2_val > cutoff_gam2, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(val$over_50k), data=as.factor(pred_over50_bin_gam2_val))
+```
+
+## Assessing the Random Forest's performance on validation.
+```{r}
+# Predicted probabilities and ROC curve
+pred_rf_val = predict(rf2, val, type = 'prob')
+
+rf_roc_val <- rocit(pred_rf_val[,2], as.numeric(val$over_50k))
+plot(rf_roc_val)
+
+# Looking at the AUC for the RF
+rf_roc_val$AUC
+
+# Binning based on established cutoff
+pred_over50_bin_rf_val <- ifelse(pred_rf_val[,2] > cutoff_rf, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference=as.factor(val$over_50k), data=as.factor(pred_over50_bin_rf_val))
+```
+All models perform very similarly. The all have very similar AUC (0.9 and 0.91) and very similar accuracy (0.81-0.82). The second GAM model has the highest AUC. The random forest has the highest accuracy. The random forest has the highest sensitivity, while the second GAM has the highest specificity. The larger difference in AUC and accuracy between the train and validation for the RF may indicate that it's overfitting to training. Because all models are performing so similarly, I am going to move forward with the one that is the simplest and most interpretable, which is the first logistic regression (model 4).
+
+# Final Model Assessment
+## Preparing the test data for the final model evaluation.
+```{r}
+## Combining Preschool with 1st-4th (the next closest education level and proportionally similar with outcome)
+test$education_level_fix <- ifelse(test$education_level=="Preschool", '1st-4th',test$education_level)
+table(test$education_level_fix)
+
+## Combining Never-Worked with without-pay (the next closest job category and most proportionally similar with outcome)
+test$workclass_fix <- ifelse(test$workclass=="Never-worked", 'Without-pay',test$workclass)
+table(test$workclass_fix)
+
+# Binning age.
+test = test %>% mutate(age_bin = cut(age, breaks=c(0, 23, 26, 28, 29, 31, 35, 61, 90)))
+
+# Binning capital_gain.
+test$capital_gain_bin = ifelse(test$capital_gain > 5060, '[0,5060]', '(5060, 99999]')
+
+# Binning capital_loss.
+test$capital_loss_bin = ifelse(test$capital_loss > 1816, '[0,1816]', '(1816, 4356]')
+
+# Binning hours_week.
+test = test %>% mutate(hours_week_bin = cut(hours_week, breaks=c(0, 34, 39, 43, 99)))
+```
+
+## Performance metrics on test data
+```{r}
+# Making predictions on test with logistic model 4
+pred_over50k_m4_test = predict(model_4, test, type = 'response')
+
+# Creating a binary variable based on the already established cutoff
+pred_over50_bin_m4_test <- ifelse(pred_over50k_m4_test > cutoff_m4, 1, 0)
+
+# Confusion Matrix
+confusionMatrix(reference = as.factor(test$over_50k), data = as.factor(pred_over50_bin_m4_test))
+```
+## Odds ratios for final model.
+```{r}
+exp(cbind(coef(model_4)))
+```
+
+
+## Figure - Relationship between relationship and having an income over $50k.
+```{r}
+ggplot(census) +
+  geom_bar(aes(x = relationship, fill = factor(over_50k)), 
+           position = "dodge") +
+           labs(x = "Relationship", y = "Individual Count", fill = "Annual Income") + 
+           scale_fill_discrete(labels = c("<= $50k", "> $50k")) + 
+           theme_bw()
+
+```
+
